@@ -1,0 +1,198 @@
+---------------------------------------
+-- Gun ServerScript (with comments)
+---------------------------------------
+-- Services --
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local Debris = game:GetService("Debris")
+
+-- Variables --
+local gunEvent = ReplicatedStorage.Remotes.GunEvent
+
+local timeSinceLastShot = {} -- keeping track of time since last shot
+local whoIsReloading = {} -- keeping track of what gun is being reloaded
+
+-- Constants --
+local MAX_DISCREPANCY_DIST = 10
+
+-- Functions --
+
+local function createMuzzleFlash(parent, lightProperties)
+	local light = Instance.new("PointLight")
+	for property, value in pairs(lightProperties) do
+		light[property] = value
+	end
+	light.Parent = parent
+	light.Enabled = true
+	return light
+end
+
+local function createSound(parent, soundProperties)
+	local sound = Instance.new("Sound")
+	for property,value in pairs(soundProperties) do
+		sound[property] = value
+	end
+	sound.Parent = parent
+	return sound
+end
+
+
+local function CreateBulletHole(Properties , result)
+	
+	if not result then return end
+	
+	local bulletHole = ReplicatedStorage.Shared.Parts.BulletHole:Clone()
+	local Weld = Instance.new("WeldConstraint")
+	
+	Weld.Part0 = bulletHole
+	Weld.Part1 = result.Instance
+	Weld.Parent = bulletHole
+	
+	bulletHole.Size = Properties.BulletHoleSize
+	bulletHole.CFrame = CFrame.new(result.Position ,result.Position + result.Normal)
+	bulletHole.Parent = workspace.WaveGameMap.FilteringFolder.BulletHole
+	bulletHole:FindFirstChildWhichIsA("Decal").Color3 = result.Instance.Color
+	
+	bulletHole.ParticleEmitter.Color = ColorSequence.new(result.Instance.Color)
+	bulletHole.ParticleEmitter:Emit(Properties.BulletHoleParticleAmount)
+	
+	Debris:AddItem(bulletHole,10)-- how much time will the bullet hole will remain in the part before removing
+	
+end
+
+
+local function checkBulletRay(properties, result)
+	if not result then return end
+
+	local character = result.Instance.Parent
+	if not character:FindFirstChildWhichIsA("Humanoid") or Players:GetPlayerFromCharacter(character) then return end
+
+	local offset = (result.Position - result.InstanceOriginPosition)
+	-- the offset is the distance between where on the limb we hit and the origin position of said limb
+	local serverCFrameOffset = CFrame.new(result.Instance.Position) * CFrame.new(offset)
+	-- using the offset, we calculate the position of the hit area on the SERVER, as it may be slightly off from the client
+
+	if (result.Position - serverCFrameOffset.Position).Magnitude > MAX_DISCREPANCY_DIST then return end
+	--[[ 
+	by the time this information from client reaches the server, if the position of the part
+	that got hit is within 10 studs of the position the client said they hit, then damage the character
+	
+	there is going to be a slight difference in the distance between where the client said they hit and where we see the location
+	of being hit on the server, but that difference in distance shouldn't be huge
+	
+	10 studs is a generous estimate for lag, etc., and you probably shouldn't exceed this number
+	]]
+
+	character.Humanoid:TakeDamage(properties.Damage * properties.BodyPartMultipliers[result.Instance.Name])
+end
+
+local function reload(player, gun, properties)
+	local ammoInMag = gun:GetAttribute("AmmoInMag")
+	local ammoReserve = gun:GetAttribute("AmmoReserve")
+	if ammoInMag == properties.MaxMagAmmo then return end 
+	if ammoReserve <= 0 then return end
+
+	if (DateTime.now().UnixTimestampMillis - timeSinceLastShot[player.Name][gun.Name]) < properties.ReloadDuration then return end
+	-- the player somehow reloaded FASTER than the reload animation length (probably exploits)
+
+	if not whoIsReloading[player.Name] then
+		whoIsReloading[player.Name] = {[gun.Name] = true}
+	else
+		if whoIsReloading[player.Name][gun.Name] then return end
+	end
+	whoIsReloading[player.Name][gun.Name] = true
+
+	local ammoNeeded = math.min(properties.MaxMagAmmo - ammoInMag, ammoReserve)
+	-- math.min will return us either whats left in ammo reserve or how much ammo we need if it doesn't exceed ammo reserve amount
+
+	gun:SetAttribute("AmmoInMag", ammoInMag+ammoNeeded)
+	gun:SetAttribute("AmmoReserve", ammoReserve-ammoNeeded)
+
+	whoIsReloading[player.Name][gun.Name] = false
+end
+
+local function shoot(player : Player, gun : Tool, properties, result)
+	if gun:GetAttribute("AmmoInMag") == 0 then return end
+
+	if not timeSinceLastShot[player.Name] then 
+		-- create a new table for the player if they don't have one
+		timeSinceLastShot[player.Name] = {[gun.Name] = 0, ["PelletCount"] = 1}
+	end
+	if not timeSinceLastShot[player.Name][gun.Name] then
+		-- create a new key-value pair for a new gun
+		timeSinceLastShot[player.Name][gun.Name] = 0
+	end
+
+	if gun:GetAttribute("GunType") == "Spread" then
+		if DateTime.now().UnixTimestampMillis - timeSinceLastShot[player.Name][gun.Name] < 60/properties.FireRate then 
+			return
+		else
+			timeSinceLastShot[player.Name]["PelletCount"] += 1
+		end
+
+		if timeSinceLastShot[player.Name]["PelletCount"] >= properties.TotalPellets then
+			-- wait until pellet count reaches total number of pellets before updating time
+			timeSinceLastShot[player.Name][gun.Name] = DateTime.now().UnixTimestampMillis
+			timeSinceLastShot[player.Name]["PelletCount"] = 0
+
+			-- deduct ammo and play sound for final pellet
+			gun:SetAttribute("AmmoInMag", gun:GetAttribute("AmmoInMag") - 1)
+			local light = createMuzzleFlash(gun.Handle.Muzzle, properties.MuzzleFlashProperties)
+			task.spawn(function()
+				task.wait(0.15)
+				light:Destroy()
+			end)
+			gun.Handle.Muzzle.Flash:Emit(1)
+
+			local sound = createSound(gun.Handle.Muzzle, properties.ShootSoundProperties)
+			sound:Play()
+			sound.Ended:Connect(function() sound:Destroy() end)
+
+			checkBulletRay(properties, result)
+			CreateBulletHole(properties , result)
+		else
+			-- !do not play sound or muzzle flash until last pellet is fired!
+			checkBulletRay(properties, result)
+			CreateBulletHole(properties , result)
+		end
+
+	elseif gun:GetAttribute("GunType") == "Standard" then 
+		if DateTime.now().UnixTimestampMillis - timeSinceLastShot[player.Name][gun.Name] < 60/properties.FireRate then return end
+		timeSinceLastShot[player.Name][gun.Name] = DateTime.now().UnixTimestampMillis
+
+		gun:SetAttribute("AmmoInMag", gun:GetAttribute("AmmoInMag") - 1)
+		local light = createMuzzleFlash(gun.Handle.Muzzle, properties.MuzzleFlashProperties)
+		task.spawn(function()
+			task.wait(0.15)
+			light:Destroy()
+		end)
+		gun.Handle.Muzzle.Flash:Emit(1)
+
+		local sound = createSound(gun.Handle.Muzzle, properties.ShootSoundProperties)
+		sound:Play()
+		sound.Ended:Connect(function() sound:Destroy() end)
+
+		checkBulletRay(properties, result)
+		CreateBulletHole(properties , result)
+	end
+end
+
+-- Event handlers --
+gunEvent.OnServerEvent:Connect(function(player : Player, action, ...)
+	if not player.Character then return end
+	local gun = player.Character:FindFirstChildWhichIsA("Tool")
+	if not gun:GetAttribute("GunType") then return end
+	local properties = require(gun.Properties)
+
+	if action == "ValidateShot" then
+		local args = {...}
+		if args[1] and args[2] and args[3] and args[4] then
+			args = {["Instance"] = args[1], ["Position"] = args[2], ["Normal"] = args[3], ["InstanceOriginPosition"] = args[4]}
+		else
+			args = nil
+		end
+		shoot(player, gun, properties, args)
+	elseif action == "ValidateReload" then
+		reload(player, gun, properties)
+	end
+end)
